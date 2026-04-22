@@ -211,3 +211,333 @@ if ~isempty(all_detected_freqs)
         grid on;
     end
 end
+
+function zip_to_barcode(zipPath, outputImagePath, moduleSize)
+% ZIP_TO_BARCODE Encode a zip file into a printable 2D barcode image.
+%
+%   zip_to_barcode(zipPath, outputImagePath, moduleSize)
+%
+%   Inputs:
+%     zipPath         - path to the .zip file to encode
+%     outputImagePath - path for the output PNG (e.g. ‘barcode.png’)
+%     moduleSize      - (optional) pixels per data module (default 8)
+%
+%   The output is a 2D matrix-style barcode with:
+%     - L-shaped finder pattern (solid left + bottom borders)
+%     - Dotted timing pattern (top + right borders)
+%     - A 64-bit header encoding the payload length in bytes
+%     - CRC-32 checksum appended to the payload for integrity
+%     - Quiet zone (white border) around the symbol
+%
+%   Uses ONLY built-in MATLAB functions (no toolboxes required).
+
+```
+if nargin < 3 || isempty(moduleSize)
+    moduleSize = 8;
+end
+
+% ---- 1. Read the zip file as raw bytes -----------------------------
+fid = fopen(zipPath, 'rb');
+if fid < 0
+    error('Could not open file: %s', zipPath);
+end
+payload = fread(fid, inf, 'uint8=>uint8');
+fclose(fid);
+payload = payload(:);               % column vector
+nBytes  = numel(payload);
+fprintf('Read %d bytes from %s\n', nBytes, zipPath);
+
+% ---- 2. Append CRC-32 of the payload -------------------------------
+crc = crc32(payload);               % uint32
+crcBytes = typecast(swapbytes(crc), 'uint8');   % big-endian 4 bytes
+payloadWithCrc = [payload; crcBytes(:)];
+
+% ---- 3. Build header: 8 bytes = payload length (big-endian) --------
+lenBytes = typecast(swapbytes(uint64(nBytes)), 'uint8');
+fullStream = [lenBytes(:); payloadWithCrc];
+
+% ---- 4. Convert bytes to a bit stream (MSB first) ------------------
+bits = byteStreamToBits(fullStream);
+nBits = numel(bits);
+
+% ---- 5. Decide grid size: square, with reserved borders ------------
+% Reserve 1 row/col on all four sides for finder + timing patterns.
+% So usable data area = (N-2) x (N-2) bits.
+N = ceil(sqrt(nBits)) + 2;
+while (N-2)^2 < nBits
+    N = N + 1;
+end
+fprintf('Encoding %d bits in a %dx%d module grid\n', nBits, N, N);
+
+% ---- 6. Build the module grid (0 = white, 1 = black) ---------------
+grid = zeros(N, N, 'uint8');
+
+% Solid finder pattern: left column and bottom row
+grid(:, 1)   = 1;
+grid(end, :) = 1;
+
+% Timing pattern: alternating on top row and right column
+topRow = mod(0:N-1, 2);             % 0,1,0,1,...
+grid(1, :) = topRow;
+grid(:, end) = mod((0:N-1)', 2);
+
+% Corners fixups so finder L is clean
+grid(1, 1) = 1;                     % top-left start of L? keep black
+grid(end, end) = 1;                 % bottom-right corner black
+grid(1, end)   = 1;                 % top-right anchor black
+
+% Fill data area row-by-row, left-to-right, top-to-bottom
+dataRows = 2:N-1;
+dataCols = 2:N-1;
+bitIdx = 1;
+for r = dataRows
+    for c = dataCols
+        if bitIdx <= nBits
+            grid(r, c) = bits(bitIdx);
+            bitIdx = bitIdx + 1;
+        else
+            % Pad remaining modules with a fixed pattern (checker)
+            grid(r, c) = mod(r + c, 2);
+        end
+    end
+end
+
+% ---- 7. Upscale to moduleSize pixels per module --------------------
+img = kron(grid, ones(moduleSize, moduleSize, 'uint8'));
+% Convert to black/white image: 0 = black ink, 255 = white paper
+img = uint8(255 * (1 - img));
+
+% ---- 8. Add quiet zone (white border) ------------------------------
+quiet = 4 * moduleSize;
+[h, w] = size(img);
+framed = 255 * ones(h + 2*quiet, w + 2*quiet, 'uint8');
+framed(quiet+1:quiet+h, quiet+1:quiet+w) = img;
+
+% ---- 9. Save as PNG ------------------------------------------------
+imwrite(framed, outputImagePath);
+fprintf('Saved barcode image (%dx%d px) to %s\n', ...
+        size(framed,2), size(framed,1), outputImagePath);
+fprintf('Grid: %dx%d modules, moduleSize=%d px\n', N, N, moduleSize);
+```
+
+end
+
+% ======================================================================
+function bits = byteStreamToBits(bytes)
+% Convert a uint8 column vector into a column vector of bits (MSB first).
+bytes = uint8(bytes(:));
+n = numel(bytes);
+bits = zeros(8*n, 1, ‘uint8’);
+for k = 0:7
+bits(k+1:8:end) = bitget(bytes, 8-k);
+end
+end
+
+% ======================================================================
+function c = crc32(data)
+% CRC32 Compute the IEEE 802.3 CRC-32 of a uint8 vector.
+data = uint8(data(:));
+persistent table
+if isempty(table)
+table = zeros(256, 1, ‘uint32’);
+poly  = uint32(hex2dec(‘EDB88320’));
+for i = 0:255
+r = uint32(i);
+for j = 1:8
+if bitand(r, uint32(1))
+r = bitxor(bitshift(r, -1), poly);
+else
+r = bitshift(r, -1);
+end
+end
+table(i+1) = r;
+end
+end
+c = uint32(hex2dec(‘FFFFFFFF’));
+for k = 1:numel(data)
+idx = bitand(bitxor(c, uint32(data(k))), uint32(255)) + 1;
+c = bitxor(bitshift(c, -8), table(idx));
+end
+c = bitxor(c, uint32(hex2dec(‘FFFFFFFF’)));
+end
+
+function barcode_to_zip(imagePath, outputZipPath)
+% BARCODE_TO_ZIP Decode a 2D barcode image (made by zip_to_barcode) back
+% into its original zip file.
+%
+%   barcode_to_zip(imagePath, outputZipPath)
+%
+%   Inputs:
+%     imagePath     - path to the PNG produced by zip_to_barcode
+%     outputZipPath - path for the recovered .zip
+%
+%   Uses ONLY built-in MATLAB functions.
+
+```
+% ---- 1. Load image and binarize -----------------------------------
+img = imread(imagePath);
+if ndims(img) == 3
+    img = uint8(mean(img, 3));
+end
+% Black modules in the image are 0, white are 255 -> invert
+% so that data-modules = 1, paper = 0.
+bw = img < 128;
+
+% ---- 2. Crop off the quiet zone (white border) --------------------
+colHas = any(bw, 1);
+rowHas = any(bw, 2);
+c1 = find(colHas, 1, 'first');  c2 = find(colHas, 1, 'last');
+r1 = find(rowHas, 1, 'first');  r2 = find(rowHas, 1, 'last');
+if isempty(c1) || isempty(r1)
+    error('No barcode content found in image.');
+end
+bw = bw(r1:r2, c1:c2);
+[H, W] = size(bw);
+
+% ---- 3. Determine module size from the solid bottom finder bar ----
+% The bottom row of the symbol is one module tall. Scan UP from the
+% bottom at a middle column until we exit black. The left column
+% is also one module wide but a scan through the data area can be
+% inflated by an adjacent black data module, so we use it only as
+% a sanity check and take the minimum.
+midCol = round(W/2);
+botRun = 0;
+for y = H:-1:1
+    if bw(y, midCol)
+        botRun = botRun + 1;
+    else
+        break;
+    end
+end
+midRow = round(H/2);
+leftRun = 0;
+for x = 1:W
+    if bw(midRow, x)
+        leftRun = leftRun + 1;
+    else
+        break;
+    end
+end
+if botRun >= 1
+    moduleSize = min(leftRun, botRun);
+else
+    moduleSize = leftRun;
+end
+if moduleSize < 1
+    error('Could not detect module size.');
+end
+fprintf('Detected moduleSize = %d pixels\n', moduleSize);
+
+% ---- 4. Compute grid dimensions and sample each module ------------
+N = round(H / moduleSize);
+if round(W / moduleSize) ~= N
+    % Allow slight rounding mismatch; use the average
+    N = round((H + W) / (2 * moduleSize));
+end
+fprintf('Detected grid size = %dx%d modules\n', N, N);
+
+grid = zeros(N, N, 'uint8');
+for r = 1:N
+    for c = 1:N
+        % Sample center pixel of each module
+        y = round((r - 0.5) * moduleSize);
+        x = round((c - 0.5) * moduleSize);
+        y = max(1, min(H, y));
+        x = max(1, min(W, x));
+        grid(r, c) = bw(y, x);
+    end
+end
+
+% ---- 5. Extract data-area bits (inner (N-2)x(N-2) block) ----------
+dataArea = grid(2:N-1, 2:N-1);
+bits = reshape(dataArea', [], 1);     % row-major, matches encoder
+
+% ---- 6. Convert bits back into bytes ------------------------------
+nFullBytes = floor(numel(bits) / 8);
+bits = bits(1:nFullBytes*8);
+bytes = bitsToByteStream(bits);
+
+% ---- 7. Parse header: first 8 bytes = payload length --------------
+if numel(bytes) < 12
+    error('Decoded data is too short to contain header + CRC.');
+end
+lenBytes = bytes(1:8);
+nBytes = double(swapbytes(typecast(uint8(lenBytes), 'uint64')));
+fprintf('Header says payload length = %d bytes\n', nBytes);
+
+if numel(bytes) < 8 + nBytes + 4
+    error(['Decoded data shorter than header claims ' ...
+           '(have %d, need %d).'], numel(bytes), 8 + nBytes + 4);
+end
+
+payload  = bytes(9:8+nBytes);
+crcBytes = bytes(8+nBytes+1 : 8+nBytes+4);
+storedCrc = swapbytes(typecast(uint8(crcBytes), 'uint32'));
+
+% ---- 8. Verify CRC-32 ---------------------------------------------
+computedCrc = crc32(payload);
+if storedCrc ~= computedCrc
+    warning(['CRC mismatch! stored=0x%08X computed=0x%08X. ' ...
+             'File may be corrupted.'], storedCrc, computedCrc);
+else
+    fprintf('CRC-32 OK (0x%08X)\n', storedCrc);
+end
+
+% ---- 9. Write the recovered zip -----------------------------------
+fid = fopen(outputZipPath, 'wb');
+if fid < 0
+    error('Could not open output file: %s', outputZipPath);
+end
+fwrite(fid, payload, 'uint8');
+fclose(fid);
+fprintf('Recovered zip written to %s (%d bytes)\n', ...
+        outputZipPath, numel(payload));
+```
+
+end
+
+% ======================================================================
+function bytes = bitsToByteStream(bits)
+bits = uint8(bits(:));
+n = floor(numel(bits) / 8);
+bytes = zeros(n, 1, ‘uint8’);
+for k = 0:7
+bytes = bitor(bytes, bitshift(bits(k+1:8:8*n), 7-k));
+end
+end
+
+% ======================================================================
+function c = crc32(data)
+data = uint8(data(:));
+persistent table
+if isempty(table)
+table = zeros(256, 1, ‘uint32’);
+poly  = uint32(hex2dec(‘EDB88320’));
+for i = 0:255
+r = uint32(i);
+for j = 1:8
+if bitand(r, uint32(1))
+r = bitxor(bitshift(r, -1), poly);
+else
+r = bitshift(r, -1);
+end
+end
+table(i+1) = r;
+end
+end
+c = uint32(hex2dec(‘FFFFFFFF’));
+for k = 1:numel(data)
+idx = bitand(bitxor(c, uint32(data(k))), uint32(255)) + 1;
+c = bitxor(bitshift(c, -8), table(idx));
+end
+c = bitxor(c, uint32(hex2dec(‘FFFFFFFF’)));
+end
+
+
+
+
+
+
+
+
+
